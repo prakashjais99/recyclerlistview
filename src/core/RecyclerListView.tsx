@@ -32,7 +32,7 @@ import { Constants } from "./constants/Constants";
 import { Messages } from "./constants/Messages";
 import BaseScrollComponent from "./scrollcomponent/BaseScrollComponent";
 import BaseScrollView, { ScrollEvent, ScrollViewDefaultProps } from "./scrollcomponent/BaseScrollView";
-import { TOnItemStatusChanged, WindowCorrection } from "./ViewabilityTracker";
+import ViewabilityTracker, { TOnItemStatusChanged, WindowCorrection } from "./ViewabilityTracker";
 import VirtualRenderer, { RenderStack, RenderStackItem, RenderStackParams } from "./VirtualRenderer";
 import ItemAnimator, { BaseItemAnimator } from "./ItemAnimator";
 import { DebugHandlers } from "..";
@@ -88,9 +88,12 @@ export interface RecyclerListViewProps {
     onEndReached?: () => void;
     onEndReachedThreshold?: number;
     onEndReachedThresholdRelative?: number;
+    onStartReached?: () => void;
+    onStartReachedThreshold?: number;
     onVisibleIndexesChanged?: TOnItemStatusChanged;
     onVisibleIndicesChanged?: TOnItemStatusChanged;
     renderFooter?: () => JSX.Element | JSX.Element[] | null;
+    renderHeader?: () => JSX.Element | JSX.Element[] | null;
     externalScrollView?: { new(props: ScrollViewDefaultProps): BaseScrollView };
     layoutSize?: Dimension;
     initialOffset?: number;
@@ -140,6 +143,7 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
         isHorizontal: false,
         onEndReachedThreshold: 0,
         onEndReachedThresholdRelative: 0,
+        onStartReachedThreshold: 0,
         renderAheadOffset: IS_WEB ? 1000 : 250,
     };
 
@@ -150,6 +154,7 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
     });
 
     private _virtualRenderer: VirtualRenderer;
+    private _onStartReachedCalled = false;
     private _onEndReachedCalled = false;
     private _initComplete = false;
     private _isMounted = true;
@@ -232,7 +237,7 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
 
     public componentDidUpdate(): void {
         this._processInitialOffset();
-        this._processOnEndReached();
+        this._processOnEdgeReached();
         this._checkAndChangeLayouts(this.props);
         this._virtualRenderer.setOptimizeForAnimations(false);
     }
@@ -240,7 +245,7 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
     public componentDidMount(): void {
         if (this._initComplete) {
             this._processInitialOffset();
-            this._processOnEndReached();
+            this._processOnEdgeReached();
         }
     }
 
@@ -421,6 +426,7 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
                 {...this.props.scrollViewProps}
                 onScroll={this._onScroll}
                 onSizeChanged={this._onSizeChanged}
+                onWindowResize={this._processOnEdgeReached}
                 contentHeight={this._initComplete ? this._virtualRenderer.getLayoutDimension().height : 0}
                 contentWidth={this._initComplete ? this._virtualRenderer.getLayoutDimension().width : 0}
                 renderAheadOffset={this.getCurrentRenderAheadOffset()}>
@@ -516,13 +522,34 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
             }
             this._refreshViewability();
         } else if (this.props.dataProvider !== newProps.dataProvider) {
+            const onStartReachedCalled = this._onStartReachedCalled;
             if (newProps.dataProvider.getSize() > this.props.dataProvider.getSize()) {
-                this._onEndReachedCalled = false;
+                this._setOnEdgeReachedCalled(false);
             }
             const layoutManager = this._virtualRenderer.getLayoutManager();
             if (layoutManager) {
+                const virtualLayoutDimensionsBeforeUpdate: Dimension = layoutManager.getContentDimension();
                 layoutManager.relayoutFromIndex(newProps.dataProvider.getFirstIndexToProcessInternal(), newProps.dataProvider.getSize());
-                this._virtualRenderer.refresh();
+                const virtualLayoutDimensionsAfterUpdate: Dimension = layoutManager.getContentDimension();
+                const viewabilityTracker: ViewabilityTracker | null = this._virtualRenderer.getViewabilityTracker();
+                // NOTE: This works for most cases, but relies on an assumption that any items loaded during the onStartReached callback
+                //       were prepended to the dataset (not inserted at the end or middle somewhere).
+                if (viewabilityTracker && onStartReachedCalled) {
+                    // Adjust offset for prepended items
+                    const previousOffset: number = viewabilityTracker.getLastOffset();
+                    const adjustedOffset: number = this.props.isHorizontal
+                        ? previousOffset + virtualLayoutDimensionsAfterUpdate.width - virtualLayoutDimensionsBeforeUpdate.width
+                        : previousOffset + virtualLayoutDimensionsAfterUpdate.height - virtualLayoutDimensionsBeforeUpdate.height;
+                    const offsetX = (this.props.isHorizontal ? adjustedOffset : undefined) as number;
+                    const offsetY = (this.props.isHorizontal ? undefined : adjustedOffset) as number;
+                    this._virtualRenderer.updateOffset(
+                        offsetX,
+                        offsetY,
+                        true,
+                        this._getWindowCorrection(offsetX, offsetY, this.props),
+                    );
+                }
+                this._virtualRenderer.refresh(onStartReachedCalled);
             }
         } else if (forceFullRender) {
             const layoutManager = this._virtualRenderer.getLayoutManager();
@@ -571,12 +598,15 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
         }
         const hasHeightChanged = this._layout.height !== layout.height;
         const hasWidthChanged = this._layout.width !== layout.width;
-        this._layout.height = layout.height;
-        this._layout.width = layout.width;
+        this._layout.height = Math.round(layout.height);
+        this._layout.width = Math.round(layout.width);
+        if (layout.height === 0 || layout.width === 0) {
+            throw new CustomError(RecyclerListViewExceptions.layoutException);
+        }
         if (!this._initComplete) {
             this._initComplete = true;
             this._initTrackers(this.props);
-            this._processOnEndReached();
+            this._processOnEdgeReached();
         } else {
             if ((hasHeightChanged && hasWidthChanged) ||
                 (hasHeightChanged && this.props.isHorizontal) ||
@@ -758,32 +788,36 @@ export default class RecyclerListView<P extends RecyclerListViewProps, S extends
         if (this.props.onScroll) {
             this.props.onScroll(rawEvent, offsetX, offsetY);
         }
-        this._processOnEndReached();
+        this._processOnEdgeReached();
     }
 
-    private _processOnEndReached(): void {
-        if (this.props.onEndReached && this._virtualRenderer) {
-            const layout = this._virtualRenderer.getLayoutDimension();
+    private _processOnEdgeReached = (): void => {
+        if (!this._getOnEdgeReachedCalled() && this._virtualRenderer && (this.props.onEndReached || this.props.onStartReached)) {
+            const virtualLayout = this._virtualRenderer.getLayoutDimension();
             const viewabilityTracker = this._virtualRenderer.getViewabilityTracker();
             if (viewabilityTracker) {
-                const windowBound = this.props.isHorizontal ? layout.width - this._layout.width : layout.height - this._layout.height;
-                const lastOffset = viewabilityTracker ? viewabilityTracker.getLastOffset() : 0;
-                const threshold = windowBound - lastOffset;
-
-                const listLength = this.props.isHorizontal ? this._layout.width : this._layout.height;
-                const triggerOnEndThresholdRelative = listLength * Default.value<number>(this.props.onEndReachedThresholdRelative, 0);
-                const triggerOnEndThreshold = Default.value<number>(this.props.onEndReachedThreshold, 0);
-
-                if (threshold <= triggerOnEndThresholdRelative || threshold <= triggerOnEndThreshold) {
-                    if (this.props.onEndReached && !this._onEndReachedCalled) {
-                        this._onEndReachedCalled = true;
-                        this.props.onEndReached();
-                    }
-                } else {
-                    this._onEndReachedCalled = false;
+                const windowBound = this.props.isHorizontal ? virtualLayout.width - this._layout.width : virtualLayout.height - this._layout.height;
+                const lastOffset = viewabilityTracker.getLastOffset();
+                const isWithinEndThreshold = windowBound - lastOffset <= Default.value<number>(this.props.onEndReachedThreshold, 0);
+                const isWithinStartThreshold = lastOffset <= Default.value<number>(this.props.onStartReachedThreshold, 0);
+                if (this.props.onEndReached && isWithinEndThreshold) {
+                    this._onEndReachedCalled = true;
+                    this.props.onEndReached();
+                } else if (this.props.onStartReached && isWithinStartThreshold) {
+                    this._onStartReachedCalled = true;
+                    this.props.onStartReached();
                 }
             }
         }
+    }
+
+    private _getOnEdgeReachedCalled(): boolean {
+        return this._onStartReachedCalled || this._onEndReachedCalled;
+    }
+
+    private _setOnEdgeReachedCalled(onEdgeReachedCalled: boolean): void {
+        this._onStartReachedCalled = onEdgeReachedCalled;
+        this._onEndReachedCalled = onEdgeReachedCalled;
     }
 }
 
@@ -832,12 +866,20 @@ RecyclerListView.propTypes = {
     //Specify how far from the end (in units of visible length of the list)
     //the bottom edge of the list must be from the end of the content to trigger the onEndReached callback
     onEndReachedThresholdRelative: PropTypes.number,
+    //Callback given when user scrolls to the start of the list, useful in incremental loading scenarios.
+    onStartReached: PropTypes.func,
+
+    //Specify how many pixels in advance you onStartReached callback
+    onStartReachedThreshold: PropTypes.number,
 
     //Deprecated. Please use onVisibleIndicesChanged instead.
     onVisibleIndexesChanged: PropTypes.func,
 
     //Provides visible index, helpful in sending impression events etc, onVisibleIndicesChanged(all, now, notNow)
     onVisibleIndicesChanged: PropTypes.func,
+
+    // Provide this method if you want to render a header. Helpful in showing a loading while doing incremental loads.
+    renderHeader: PropTypes.func,
 
     //Provide this method if you want to render a footer. Helpful in showing a loader while doing incremental loads.
     renderFooter: PropTypes.func,

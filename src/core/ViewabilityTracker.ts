@@ -74,10 +74,9 @@ export default class ViewabilityTracker {
         this._windowBound = isHorizontal ? dimension.width : dimension.height;
     }
 
-    public forceRefresh(): boolean {
-        const shouldForceScroll = this._actualOffset >= 0 && this._currentOffset >= (this._maxOffset - this._windowBound);
+    public forceRefresh(shouldForceScroll: boolean = false): boolean {
         this.forceRefreshWithOffset(this._currentOffset);
-        return shouldForceScroll;
+        return shouldForceScroll || this._currentOffset >= (this._maxOffset - this._windowBound);
     }
 
     public forceRefreshWithOffset(offset: number): void {
@@ -94,7 +93,7 @@ export default class ViewabilityTracker {
         }
 
         if (this._currentOffset !== correctedOffset) {
-            this._currentOffset = correctedOffset;
+            this._currentOffset = Math.round(correctedOffset);
             this._updateTrackingWindows(offset, windowCorrection);
             let startIndex = 0;
             if (this._visibleIndexes.length > 0) {
@@ -170,7 +169,7 @@ export default class ViewabilityTracker {
     }
 
     private _doInitialFit(offset: number, windowCorrection: WindowCorrection): void {
-        offset = Math.min(this._maxOffset, Math.max(0, offset));
+        offset = Math.round(Math.min(this._maxOffset, Math.max(0, offset)));
         this._updateTrackingWindows(offset, windowCorrection);
         const firstVisibleIndex = this._findFirstVisibleIndexOptimally();
         this._fitAndUpdate(firstVisibleIndex);
@@ -303,10 +302,10 @@ export default class ViewabilityTracker {
 
     private _updateTrackingWindows(offset: number, correction: WindowCorrection): void {
         const startCorrection = correction.windowShift + correction.startCorrection;
-        const bottomCorrection = correction.windowShift + correction.endCorrection;
+        const endCorrection = correction.windowShift + correction.endCorrection;
 
         const startOffset = offset + startCorrection;
-        const endOffset = (offset + this._windowBound) + bottomCorrection;
+        const endOffset = (offset + this._windowBound) + endCorrection;
 
         this._engagedWindow.start = Math.max(0, startOffset - this._renderAheadOffset);
         this._engagedWindow.end = endOffset + this._renderAheadOffset;
