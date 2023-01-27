@@ -51,10 +51,10 @@ export default class ScrollComponent extends BaseScrollComponent {
     }
 
     public componentDidMount(): void {
-        this._dimensionsChangeSubscription = Dimensions.addEventListener("change", debounce(({window}) => {
+       Dimensions.addEventListener("change", debounce(() => {
             this.props.onWindowResize({
-                width: window.width,
-                height: window.height,
+                width: Dimensions.get("window").width,
+                height: Dimensions.get("window").height,
             });
         }, 100));
     }
